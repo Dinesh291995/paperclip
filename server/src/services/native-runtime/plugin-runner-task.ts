@@ -178,7 +178,7 @@ export function createPluginRunnerTaskOwner(input: {
         if (submitted && input.accountIdentity && input.onCredentials) {
           const snapshot = await call({ kind: "credentials", accountIdentity: input.accountIdentity });
           if (snapshot.kind !== "credentials") throw new Error("Plugin Runner credential snapshot unavailable");
-          await input.onCredentials(snapshot.credential);
+          if (snapshot.credential !== null) await input.onCredentials(snapshot.credential);
         }
         if (settlement === "settled" && stoppedState?.sessionStateAvailable === true) await input.onSessionRetained?.();
         if (submitted) await call({ kind: "complete" });

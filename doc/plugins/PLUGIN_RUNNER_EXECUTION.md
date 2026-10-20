@@ -238,8 +238,14 @@ After the task and its descendants stop, Core can send this request:
 ```
 
 Return the current credential only if the stopped task and credential slot have that account identity.
-Core compares Codex account identities and refresh times before it updates its private credential file.
-The existing AI connection service then saves a newer credential in the secret provider.
+Core saves the selected grant, secret reference, and session generation on the lease.
+It does not save credential values or temporary paths there.
+After a restart, cleanup uses these references to complete the transfer.
+Core compares account identities and refresh times before it saves a newer secret value.
+An explicit account replacement or a revoked grant prevents an old refresh from overwriting that account.
+Core acknowledges task completion only after this transfer succeeds.
+Return `credential: null` only if cancellation prevented the task from starting.
+An unavailable export must fail the operation.
 A failed transfer keeps task grants available for recovery.
 The Core native path supports direct Codex and Claude accounts.
 Other managed provider routes require a dedicated credential projection before use.
@@ -320,7 +326,11 @@ PRP identity and command results     Runner state and provider session files
 3. Fail closed if retained state is missing or incompatible.
 4. Keep the retained files on the provider.
 
-Core checks the prior run, agent, workspace, environment, pinned driver, and termination evidence before it authorizes reuse. The Runner keeps the provider connection during the authenticated run-authority change. A pending, unproved transition blocks ordinary execution.
+Core checks the prior run, agent, workspace, environment, pinned driver, and termination evidence before it authorizes reuse.
+For recovery on the same run, Core first stops and releases the old tasks.
+It checks each old lease's termination receipt before it allocates a replacement.
+The new task uses `resumeFrom` to retain the saved PRP identity.
+A failed stop prevents replacement. The Runner keeps the provider connection during the authenticated run-authority change. A pending, unproved transition blocks ordinary execution.
 
 ## Setup verification
 
@@ -340,6 +350,7 @@ The Runner checks local project authentication overrides before provider startup
 
 - [Lease, RPC, and cleanup integration](../../server/src/__tests__/plugin-runner-task.integration.test.ts)
 - [Real Runner setup and retained-home tests](../../server/src/services/native-runtime/plugin-runner-probe.test.ts)
+- [Durable credential transfer](../../server/src/__tests__/plugin-task-credential-writeback.test.ts)
 - [Task ownership and cancellation](../../server/src/services/native-runtime/plugin-runner-task.test.ts)
 - [Persistent runtime resource resolution](../../packages/paperclip-runner/runner/crates/runner-core/src/persistent_agent_runtime.rs)
 

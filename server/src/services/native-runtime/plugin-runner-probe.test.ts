@@ -136,11 +136,12 @@ describe("plugin Runner setup", () => {
         finally { await first.transport.close(); }
         expect(retained).toHaveBeenCalledOnce();
         await writeFile(join(resources.provider_state!, "persistent-file"), "keep across runs");
-        for (const run of ["next", "third"]) {
-          await writeFile(join(resources.provider_state!, "AGENTS.md"), `Installed persistent instructions ${run}`);
+        for (const run of ["same", "next", "third"]) {
+          if (run !== "same") await writeFile(join(resources.provider_state!, "AGENTS.md"), `Installed persistent instructions ${run}`);
           const nextOwner = createPluginRunnerTaskOwner({ task, projectIds: [], harness: "codex", resumeFrom: "task", pollMs: 1 });
           const second = createRunnerdCodexTransport({ ...nextOwner.driver, stateDirectory, runnerArtifact: artifact,
-            runtimeContext: context(run), prpIdentity: { ...identity, runId: `run-${run}`, turnId: `turn-${run}`, itemId: `item-${run}` },
+            runtimeContext: context(run === "same" ? "first" : run),
+            prpIdentity: run === "same" ? identity : { ...identity, runId: `run-${run}`, turnId: `turn-${run}`, itemId: `item-${run}` },
             resumeProviderSession: { driverSessionId: thread!.id, providerSessionId: thread!.sessionId } as never,
             lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } });
           try {
@@ -155,13 +156,13 @@ describe("plugin Runner setup", () => {
         expect(journal.runAttachTemplate.provider.runtimeContext.mcp.bindingId).toBeNull();
         expect(journal.runAttachTemplate.provider.runtimeContext.instructions.bundle.rootPath).toBe(".");
         await expect(readFile(join(stateDirectory, "runner/runner-state.json"))).rejects.toMatchObject({ code: "ENOENT" });
-        expect(operations.filter(op => op.kind === "submit")).toHaveLength(3);
+        expect(operations.filter(op => op.kind === "submit")).toHaveLength(4);
         expect(operations.filter(op => op.kind === "submit")[1]).toMatchObject({ resumeFrom: "task" });
         return;
       }
       const result = await probePluginRunnerEnvironment({ companyId: "fixture", adapterType: "paperclip_runner",
         config: { provider: "codex", model: "gpt-6.1-sol", env: { OPENAI_API_KEY: "core-secret-not-transferred" } },
-        executionTarget: { kind: "remote", transport: "sandbox", providerKey: "plugin", leaseId: randomUUID(), remoteCwd: workspace,
+        executionTarget: { kind: "remote", transport: "sandbox", providerKey: "plugin", leaseId: randomUUID(), remoteCwd: "/runner-only/project-does-not-exist-on-core",
           runnerTaskProbe: { runId: probeRunId, sessionId: randomUUID() }, runnerTask: task },
       });
       const submission = operations.find(op => op.kind === "submit");

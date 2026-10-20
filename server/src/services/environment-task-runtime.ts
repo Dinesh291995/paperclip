@@ -1,8 +1,9 @@
+import { settlePluginTaskCredentialHandoff } from "./plugin-task-credential-writeback.js";
 import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { environmentLeases, environments, heartbeatRuns, issues, projects, type Db } from "@paperclipai/db";
 import { environmentTaskOperationSchema, parseEnvironmentTaskResult, type PluginEnvironmentTaskOperation } from "@paperclipai/plugin-sdk";
 import { pluginRegistryService } from "./plugin-registry.js";
-import { remoteExecutionHasStopped } from "./remote-execution-termination.js";
+import { hasRemoteTerminationReceipt, remoteExecutionHasStopped } from "./remote-execution-termination.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 
 export async function pluginEnvironmentSupportsTasks(db: Db, workers: PluginWorkerManager, lease: { companyId: string; metadata: Record<string, unknown> | null }) {
@@ -41,7 +42,7 @@ export async function executeEnvironmentTask(db: Db, workers: PluginWorkerManage
     && typeof probe.runId === "string" && typeof probe.sessionId === "string"
     && typeof probe.expiresAtMs === "number" && probe.expiresAtMs > Date.now();
   if ((operation.kind === "describe" || operation.kind === "submit" || operation.kind === "connection") &&
-      (!environment || (!activeProbe && run?.status !== "running") || lease.status !== "active" || (lease.expiresAt && lease.expiresAt.getTime() <= Date.now()))) throw new Error("Plugin-provided Runner execution lease is not active");
+      (metadata.runnerTaskRetiring === true || !environment || (!activeProbe && run?.status !== "running") || lease.status !== "active" || (lease.expiresAt && lease.expiresAt.getTime() <= Date.now()))) throw new Error("Plugin-provided Runner execution lease is not active");
   if (operation.kind === "submit" && !operation.resumeFrom && (operation.runner.runId !== (activeProbe ? probe.runId : run?.id) || operation.runner.leaseId !== lease.id
     || (activeProbe && (operation.runner.sessionId !== probe.sessionId || operation.projectIds.length > 0)))) {
     throw new Error("Plugin-provided Runner execution identity mismatch");
@@ -91,10 +92,17 @@ export async function executeEnvironmentTask(db: Db, workers: PluginWorkerManage
     const marked = await db.update(environmentLeases).set({
       metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ runnerTaskLease: true, runnerTaskDispatched: true, runnerTaskExecutionStopped: false, runnerTaskSessionRetained: false, runnerTaskIdentity: operation.runner })}::jsonb`,
     }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, input.companyId),
-      eq(environmentLeases.status, "active"))).returning({ id: environmentLeases.id });
+      eq(environmentLeases.status, "active"), sql`coalesce(${environmentLeases.metadata}->>'runnerTaskRetiring', 'false') != 'true'`)).returning({ id: environmentLeases.id });
     if (marked.length !== 1) throw new Error("Plugin-provided Runner execution lease is not active");
   }
   try {
+    if (operation.kind === "complete") {
+      await settlePluginTaskCredentialHandoff(db, { companyId: input.companyId, leaseId: lease.id }, metadata, async accountIdentity => {
+        const snapshot = await executeEnvironmentTask(db, workers, { ...input, operation: { kind: "credentials", accountIdentity } });
+        if (snapshot.kind !== "credentials") throw new Error("Plugin Runner credential snapshot unavailable");
+        return snapshot.credential;
+      });
+    }
     const result = await workers.call(plugin.id, "environmentTask", {
       driverKey: metadata.driverKey, companyId: input.companyId, environmentId: environment?.id ?? null,
       issueId: lease.issueId, config: driverConfig,
@@ -104,7 +112,7 @@ export async function executeEnvironmentTask(db: Db, workers: PluginWorkerManage
     const parsed = parseEnvironmentTaskResult(operation, taskId, result);
     if (parsed.kind === "status" && parsed.executionStopped === true) {
       await db.update(environmentLeases).set({
-        metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || '{"runnerTaskExecutionStopped":true}'::jsonb`,
+        metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ runnerTaskExecutionStopped: true, runnerTaskSessionRetained: parsed.sessionStateAvailable === true })}::jsonb`,
       }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, input.companyId)));
     }
     if (operation.kind === "complete") {
@@ -122,9 +130,15 @@ export async function executeEnvironmentTask(db: Db, workers: PluginWorkerManage
 
 /** Failure leaves the dispatch marker and provider handle available to cleanup retries. */
 export async function settleDispatchedEnvironmentTask(db: Db, workers: PluginWorkerManager, lease: { id: string; companyId: string }) {
-  const [current] = await db.select({ metadata: environmentLeases.metadata }).from(environmentLeases)
-    .where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, lease.companyId))).limit(1);
-  if (current?.metadata?.runnerTaskDispatched !== true) return current?.metadata?.runnerTaskExecutionStopped === true;
+  const [current] = await db.update(environmentLeases).set({
+    metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || '{"runnerTaskRetiring":true}'::jsonb`,
+  }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, lease.companyId)))
+    .returning({ metadata: environmentLeases.metadata });
+  if (current?.metadata?.runnerTaskDispatched !== true) {
+    if (current?.metadata) await settlePluginTaskCredentialHandoff(db, { companyId: lease.companyId, leaseId: lease.id }, current.metadata,
+      async () => { throw new Error("Undispatched task must not request credentials"); });
+    return current?.metadata?.runnerTaskExecutionStopped === true;
+  }
   const scope = { companyId: lease.companyId, leaseId: lease.id };
   try {
     await executeEnvironmentTask(db, workers, { ...scope, operation: { kind: "stop" } });
@@ -151,6 +165,7 @@ export async function resolvePluginTaskResume(db: Db, input: {
       or(eq(environmentLeases.id, input.leaseId), eq(heartbeatRuns.id, input.priorIdentity.runId))));
   const next = rows.find(row => row.lease.id === input.leaseId);
   const old = rows.find(row => row.run.id === input.priorIdentity.runId
+    && row.lease.id === input.priorIdentity.environmentLeaseId
     && row.lease.metadata?.runnerTaskSessionRetained === true);
   const identity = old?.lease.metadata?.runnerTaskIdentity as Record<string, unknown> | undefined;
   if (!old || !next || !old.lease.providerLeaseId || !identity ||
@@ -158,7 +173,7 @@ export async function resolvePluginTaskResume(db: Db, input: {
       identity.sessionId !== input.priorIdentity.normalizedSessionId || identity.runId !== input.priorIdentity.runId ||
       old.lease.metadata?.driver !== "plugin" || next.lease.metadata?.driver !== "plugin" ||
       !next.lease.providerLeaseId || next.lease.providerLeaseId === old.lease.providerLeaseId ||
-      !["succeeded", "interrupted", "failed", "cancelled", "timed_out"].includes(old.run.status) ||
+      (old.run.id !== next.run.id && !["succeeded", "interrupted", "failed", "cancelled", "timed_out"].includes(old.run.status)) ||
       old.run.agentId !== next.run.agentId || old.lease.issueId !== next.lease.issueId ||
       old.lease.executionWorkspaceId !== next.lease.executionWorkspaceId ||
       !old.lease.environmentId || old.lease.environmentId !== next.lease.environmentId ||
@@ -166,7 +181,9 @@ export async function resolvePluginTaskResume(db: Db, input: {
       old.lease.metadata?.pluginId !== next.lease.metadata?.pluginId || old.lease.metadata?.driverKey !== next.lease.metadata?.driverKey ||
       next.lease.status !== "active" || next.lease.releasedAt || next.run.status !== "running" ||
       (next.lease.expiresAt && next.lease.expiresAt.getTime() <= Date.now()) ||
-      !await remoteExecutionHasStopped(db, input.companyId, old.run.id)) {
+      !(old.run.id === next.run.id
+        ? rows.filter(row => row.lease.id !== next.lease.id).every(row => hasRemoteTerminationReceipt(row.lease))
+        : await remoteExecutionHasStopped(db, input.companyId, old.run.id))) {
     throw new Error("Plugin Runner retained session is not authorized");
   }
   return old.lease.providerLeaseId;

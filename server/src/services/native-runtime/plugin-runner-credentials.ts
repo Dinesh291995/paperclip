@@ -21,7 +21,7 @@ export async function preparePluginRunnerCredentials(input: {
     const parsed = JSON.parse(authJson);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Plugin Runner selected credential invalid");
     const credential = environmentTaskCredentialSchema.parse({ type: "codex-auth-json", authJson });
-    return { accountIdentity, credential,
+    return { accountIdentity, credential, needsWriteback: !!parsed.tokens,
       onCredentials: async (snapshot: PluginEnvironmentTaskCredential) => {
         if (snapshot.type !== "codex-auth-json") throw new Error("Plugin Runner credential provider mismatch");
         await copyBackCodexAuth({ hostAuthPath, readSandboxAuth: async () => Buffer.from(snapshot.authJson), log: () => {} });

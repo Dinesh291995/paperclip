@@ -17,10 +17,17 @@ describe("plugin Runner selected credentials", () => {
     const directory = await home(auth);
     const transfer = await preparePluginRunnerCredentials({ provider: "codex", identity: "revision", accountIdentity: "account", home: directory, environment: {} });
     expect(transfer.accountIdentity).toBe("account");
+    expect(transfer.needsWriteback).toBe(true);
     expect(transfer.credential).toEqual({ type: "codex-auth-json", authJson: JSON.stringify(auth) });
     const refreshed = { ...auth, tokens: { ...auth.tokens, refresh_token: "fixture-rotated" }, last_refresh: "2021-01-01T00:00:00Z" };
     await transfer.onCredentials!({ type: "codex-auth-json", authJson: JSON.stringify(refreshed) });
     expect(JSON.parse(await readFile(join(directory, "auth.json"), "utf8"))).toEqual(refreshed);
+  });
+  it("transfers a selected API key without requiring refresh authority", async () => {
+    const directory = await home({ OPENAI_API_KEY: "fixture-key" });
+    const transfer = await preparePluginRunnerCredentials({ provider: "codex", identity: "revision", accountIdentity: "account", home: directory, environment: {} });
+    expect(transfer.needsWriteback).toBe(false);
+    expect(transfer.credential).toEqual({ type: "codex-auth-json", authJson: JSON.stringify({ OPENAI_API_KEY: "fixture-key" }) });
   });
   it("does not replace the selected Codex account with a different account", async () => {
     const directory = await home(auth);

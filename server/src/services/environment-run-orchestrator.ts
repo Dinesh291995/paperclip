@@ -15,7 +15,9 @@
  * and transport logic.
  */
 
-import type { Db } from "@paperclipai/db";
+import { environmentLeases, type Db } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
+import { remoteExecutionHasStopped } from "./remote-execution-termination.js";
 import type {
   Environment,
   EnvironmentLease,
@@ -276,6 +278,8 @@ export function environmentRunOrchestrator(
     executionWorkspaceSettings: IssueExecutionWorkspaceSettings | null;
     /** Existing live runner recovery must use its original active lease, including ephemeral leases. */
     reattachRemoteLease?: { leaseId: string; providerLeaseId: string; remoteCwd: string };
+    /** A new controller must stop the previous plugin task before allocating a replacement. */
+    recoverPluginTask?: boolean;
   }): Promise<EnvironmentAcquisitionResult> {
     // Step 1: Resolve environment
     const selectedEnvironment = await resolveEnvironment({
@@ -287,6 +291,20 @@ export function environmentRunOrchestrator(
     const environment = resolveRunnerEnvironmentForRun(
       selectedEnvironment, input.adapterType, input.adapterConfig, input.admittedLifecycleMode,
     );
+
+    if (input.recoverPluginTask && environment.driver === "plugin" && input.adapterType === "paperclip_runner") {
+      const prior = await db.select().from(environmentLeases).where(and(
+        eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.heartbeatRunId, input.heartbeatRunId),
+      ));
+      if (prior.some(lease => lease.metadata?.runnerTaskLease !== true || lease.environmentId !== environment.id ||
+          lease.issueId !== input.issueId || lease.executionWorkspaceId !== (input.persistedExecutionWorkspace?.id ?? null) ||
+          lease.metadata?.agentId !== input.agentId)) throw new Error("native_plugin_recovery_lease_mismatch");
+      const errors: unknown[] = [];
+      await environmentRuntime.releaseRunLeases(input.heartbeatRunId, "released", (_id, error) => { errors.push(error); });
+      if (errors.length || (prior.length && !await remoteExecutionHasStopped(db, input.companyId, input.heartbeatRunId))) {
+        throw new Error("native_plugin_recovery_termination_unconfirmed", { cause: errors[0] });
+      }
+    }
 
     // Step 2: Acquire lease
     const acquisitionInput = {

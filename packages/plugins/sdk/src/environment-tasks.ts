@@ -61,7 +61,8 @@ export const environmentTaskOperationSchema = z.discriminatedUnion("kind", [
 
 export const environmentTaskResultSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("accepted"), taskId: providerId }).strict(),
-  z.object({ kind: z.literal("credentials"), taskId: providerId, credential: environmentTaskCredentialSchema }).strict(),
+  z.object({ kind: z.literal("credentials"), taskId: providerId, /** Null proves that cancellation fenced admission before the task could start. It must not mean an unavailable export. */
+    credential: environmentTaskCredentialSchema.nullable() }).strict(),
   z.object({ kind: z.literal("description"), taskId: providerId,
     runner: z.object({ version: z.string().min(1), digest: z.string().regex(/^sha256:[a-f0-9]{64}$/) }).strict(),
   }).strict(),
