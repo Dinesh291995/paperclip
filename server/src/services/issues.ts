@@ -1,3 +1,5 @@
+import { measureRunTransaction } from "./execution-transaction-timing.js";
+import { measureRunPhase } from "./execution-preparation-timing.js";
 import { automaticReadRecoveryCleanupCondition, touchedByUserCondition } from "./issue-participation.js";
 import { HUMAN_TASK_ORIGIN_KINDS } from "@paperclipai/shared";
 import { resolveProjectDefaultWorkspaceId } from "./project-default-workspace.js";
@@ -7,6 +9,7 @@ import { type TaskWorkspaceSelection, type TaskWorkspaceIntent } from "@papercli
 import { executionWorkspaceService } from "./execution-workspaces.js";
 import { notifyChatPublicationWork } from "./chat-work-notifications.js";
 import { notifyTerminalWorkspaceWork } from "./terminal-workspace-work.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { recordChatHandoff, recordChatCompletion, existingChatCompletionReply, acknowledgeChatCompletionReply } from "./chat-completion-delivery.js";
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
 import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
@@ -153,6 +156,7 @@ import {
   retryNativeChatReviewPresentation,
 } from "./native-runtime/native-chat-review-presentation.js";
 import {
+  applyIssueExecutionPolicyTransition,
   buildInitialIssueMonitorFields,
   normalizeIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
@@ -9392,11 +9396,12 @@ export function issueService(db: Db) {
           and(
             eq(issues.companyId, parent.companyId),
             eq(issues.parentId, parent.id),
+            notInArray(issues.status, ["done", "cancelled"]),
           ),
         );
       if (childCount >= MAX_CHILD_ISSUES_CREATED_BY_HELPER) {
         throw unprocessable(
-          `Parent issue already has the maximum ${MAX_CHILD_ISSUES_CREATED_BY_HELPER} child issues for this helper`,
+          `Parent issue already has the maximum ${MAX_CHILD_ISSUES_CREATED_BY_HELPER} active child issues for this helper`,
         );
       }
 
@@ -10380,6 +10385,7 @@ export function issueService(db: Db) {
           await notifyTerminalWorkspaceWork(tx, values.executionWorkspaceId ? `workspace:${values.executionWorkspaceId}`
             : values.parentId ? `issue:${values.parentId}` : undefined);
         }
+        if (values.monitorNextCheckAt) await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
         const [issue] = await tx.insert(issues).values(values).returning();
         await attachOwnedDraftImages(tx, issue, issue.description, { userId: issueData.createdByUserId, agentId: issueData.createdByAgentId });
         if (issue.visibility === "private" && !inheritedPrivateSubtree && issueData.createdByAgentId) {
@@ -10788,6 +10794,7 @@ export function issueService(db: Db) {
         companyGuard?: string;
         workspaceSelectionActor?: AuthorizationActor;
         expectedExecutionPolicy?: typeof issues.$inferInsert.executionPolicy;
+        expectedStatusVersion?: number;
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -10837,8 +10844,15 @@ export function issueService(db: Db) {
         companyGuard,
         workspaceSelectionActor,
         expectedExecutionPolicy,
+        expectedStatusVersion,
         ...issueData
       } = data;
+      if (expectedStatusVersion !== undefined && (
+        issueData.status !== "todo" || Object.keys(issueData).some(key => key !== "status") ||
+        nextLabelIds !== undefined || blockedByIssueIds !== undefined || expectedExecutionPolicy !== undefined
+      )) {
+        throw unprocessable("expectedStatusVersion requires a status-only backlog-to-todo promotion");
+      }
       // An explicit edit claims the title, even if it keeps the same text.
       if (issueData.title !== undefined) issueData.titleNeedsGeneration = false;
       if (
@@ -11091,6 +11105,32 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        if (expectedStatusVersion !== undefined && (
+          receiptExisting.statusVersion !== expectedStatusVersion || receiptExisting.status !== "backlog"
+        )) {
+          throw conflict("The task status or assignment changed. Read the task again before starting work.", {
+            code: "issue_status_version_changed",
+          });
+        }
+        if (expectedStatusVersion !== undefined) {
+          const policy = normalizeIssueExecutionPolicy(receiptExisting.executionPolicy ?? null);
+          const transition = applyIssueExecutionPolicyTransition({
+            issue: receiptExisting,
+            policy,
+            previousPolicy: policy,
+            requestedStatus: "todo",
+            requestedAssigneePatch: {},
+            actor: { agentId: actorAgentId ?? null, userId: actorUserId ?? null },
+            allowBoardOverride: workspaceSelectionActor?.type === "board" && workspaceSelectionActor.source !== "mcp_oauth",
+          });
+          if (transition.decision ||
+            (transition.patch.status !== undefined && transition.patch.status !== "todo") ||
+            (transition.patch.assigneeAgentId !== undefined && transition.patch.assigneeAgentId !== receiptExisting.assigneeAgentId) ||
+            (transition.patch.assigneeUserId !== undefined && transition.patch.assigneeUserId !== receiptExisting.assigneeUserId)) {
+            throw unprocessable("expectedStatusVersion requires a status-only backlog-to-todo promotion");
+          }
+          Object.assign(patch, transition.patch);
+        }
         if (issueData.executionWorkspaceId !== undefined || issueData.projectWorkspaceId !== undefined ||
             issueData.executionWorkspacePreference !== undefined || issueData.executionWorkspaceSettings !== undefined) {
           Object.assign(patch, await executionWorkspaceService(db).prepareTaskWorkspaceUpdate({
@@ -11202,6 +11242,10 @@ export function issueService(db: Db) {
           || issueData.parentId !== undefined || issueData.executionWorkspaceId !== undefined) {
           await notifyTerminalWorkspaceWork(tx, `issue:${id}`);
         }
+        if (patch.monitorNextCheckAt !== undefined || (receiptExisting.monitorNextCheckAt &&
+          (patch.status !== undefined || patch.assigneeAgentId !== undefined || patch.assigneeUserId !== undefined))) {
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
+        }
         const updated = await tx
           .update(issues)
           .set(patch)
@@ -11296,7 +11340,7 @@ export function issueService(db: Db) {
           if (updated.status === "done" || updated.status === "cancelled") {
             await finalizeSummarySlotsForTerminalIssue(tx, updated);
             // Every terminal transition funnels through here, including direct
-            // service callers (tree control, recovery, pipelines, status cards)
+            // service callers (tree control, recovery, status cards)
             // that never touch the HTTP routes. Governed cards expire; ordinary
             // historical questions remain answerable after completion.
             // Dynamic import breaks the module
@@ -12439,16 +12483,16 @@ export function issueService(db: Db) {
     ): Promise<IssueComment> {
       if (dbOrTx === db && (actor.runId || actor.userId)) {
         const append = () =>
-          db.transaction(async (tx) => {
+          measureRunTransaction(db, "response", async (tx) => {
             // Serialize run-authored comments on the issue so a provider retry
             // cannot publish the same visible result twice. This needs no schema
             // change: the issue row is the transaction fence, and the recursive
             // call below performs the lookup and insert while holding it.
-            await tx
+            await measureRunPhase("response.row_lock", () => tx
               .select({ id: issues.id })
               .from(issues)
               .where(eq(issues.id, issueId))
-              .for("update");
+              .for("update"));
             return addComment(issueId, body, actor, options, tx);
           });
         return options?.authorizationReason ===
@@ -12710,7 +12754,7 @@ export function issueService(db: Db) {
         }
       }
       if (!comment) {
-        [comment] = await dbOrTx
+        [comment] = await measureRunPhase("response.write", () => dbOrTx
           .insert(issueComments)
           .values({
             companyId: issue.companyId,
@@ -12730,7 +12774,7 @@ export function issueService(db: Db) {
               ? { updatedAt: currentInsertTimestamp }
               : {}),
           })
-          .returning();
+          .returning());
       }
       if (!comment) throw new Error("Failed to create issue comment");
       if (options?.completionReply && actor.agentId && createdByRunId) await acknowledgeChatCompletionReply(dbOrTx, createdByRunId, comment.id);
@@ -12983,7 +13027,7 @@ export function issueService(db: Db) {
               );
         const publicationCreatedAt = new Date();
         for (const binding of bindings) {
-          await dbOrTx.transaction(async (tx: DbTransaction) => {
+          await measureRunPhase("response.publish", () => dbOrTx.transaction(async (tx: DbTransaction) => {
             await notifyChatPublicationWork(tx);
             return tx
               .insert(chatPublications)
@@ -13004,12 +13048,12 @@ export function issueService(db: Db) {
                 updatedAt: publicationCreatedAt,
               })
               .onConflictDoNothing();
-          });
+          }));
           for (const [index, attachment] of boundAttachments.entries()) {
             const attachmentCreatedAt = new Date(
               publicationCreatedAt.getTime() + index + 1,
             );
-            await dbOrTx.transaction(async (tx: DbTransaction) => {
+            await measureRunPhase("response.publish", () => dbOrTx.transaction(async (tx: DbTransaction) => {
               await notifyChatPublicationWork(tx);
               return tx
                 .insert(chatPublications)
@@ -13031,7 +13075,7 @@ export function issueService(db: Db) {
                   updatedAt: attachmentCreatedAt,
                 })
                 .onConflictDoNothing();
-            });
+            }));
           }
         }
       }

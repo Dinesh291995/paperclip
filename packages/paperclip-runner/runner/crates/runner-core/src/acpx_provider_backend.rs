@@ -143,6 +143,8 @@ struct AcpxProviderDescriptor {
     mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pi_thinking_level: Option<PiThinkingLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claude_effort: Option<String>,
     permission_mode_pinned: bool,
     #[serde(default)]
     provider_policy: Option<AcpxProviderRuntimePolicy>,
@@ -273,6 +275,10 @@ impl AcpxProviderDescriptor {
             || self.model.len() > 240
             || self.model.contains('\0')
             || ((self.agent == "pi") != self.pi_thinking_level.is_some())
+            || self.claude_effort.as_ref().is_some_and(|effort| {
+                self.agent != "claude"
+                    || !matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh" | "max")
+            })
             || self.mode.as_ref().is_some_and(|mode| {
                 mode.trim().is_empty()
                     || mode.chars().count() > 240
@@ -374,6 +380,7 @@ impl AcpxProviderDescriptor {
             permission_mode: self.permission_mode,
             mode: self.mode.clone(),
             pi_thinking_level: self.pi_thinking_level,
+            claude_effort: self.claude_effort.clone(),
             permission_mode_pinned: self.permission_mode_pinned,
             provider_policy: self.provider_policy.clone(),
             system_instructions: self.instructions.clone(),
@@ -479,6 +486,9 @@ impl AcpxProviderDescriptor {
             "acpxRecordId": identity.map(|value| value.acpx_record_id.as_str()),
             "permissionMode": self.permission_mode,
         });
+        if let Some(effort) = &self.claude_effort {
+            descriptor["claudeEffort"] = json!(effort);
+        }
         if let Some(level) = self.pi_thinking_level {
             descriptor["piThinkingLevel"] = json!(level);
         }
@@ -618,6 +628,7 @@ impl AcpxDurableState {
             if identity.profile_digest != self.descriptor.command_digest
                 || identity.mode != self.descriptor.mode
                 || identity.pi_thinking_level != self.descriptor.pi_thinking_level
+                || identity.claude_effort != self.descriptor.claude_effort
             {
                 return Err(DurableRunnerError::invalid(
                     "ACPX durable identity no longer matches its qualified profile or provider mode",
@@ -1305,6 +1316,9 @@ impl AcpxCommandExecutor {
             "sessionId": identity.agent_session_id,
             "processId": process_id,
         });
+        if let Some(effort) = &identity.claude_effort {
+            result["claudeEffort"] = json!(effort);
+        }
         if let Some(level) = identity.pi_thinking_level {
             // This identity is admitted only after the sidecar's effective-mode ACK.
             result["piThinkingLevel"] = json!(level);
@@ -2388,7 +2402,7 @@ fn replacement_continuity_payload(
     })
 }
 
-fn secure_directory(path: &Path, label: &str) -> Result<(), DurableRunnerError> {
+pub(crate) fn secure_directory(path: &Path, label: &str) -> Result<(), DurableRunnerError> {
     let mut builder = DirBuilder::new();
     #[cfg(unix)]
     builder.mode(0o700);
@@ -2764,6 +2778,7 @@ mod tests {
                 permission_mode: Some(descriptor.permission_mode),
                 mode: descriptor.mode.clone(),
                 pi_thinking_level: descriptor.pi_thinking_level,
+                claude_effort: descriptor.claude_effort.clone(),
                 provider_lifetime_fence_candidates: [60_001, 60_002, 60_003],
             };
             let operations = Vec::new();
@@ -3040,6 +3055,7 @@ mod tests {
             permission_mode: Some(AcpxPermissionMode::ApproveReads),
             mode: None,
             pi_thinking_level: None,
+            claude_effort: None,
             provider_lifetime_fence_candidates: [60_001, 60_002, 60_003],
         };
 
@@ -3194,7 +3210,7 @@ mod tests {
     #[test]
     fn pi_profile_matches_published_identity_and_rejects_prior_profiles() {
         let published: Value = serde_json::from_str(include_str!(
-            "../../../../test-fixtures/pi-acp/profile-v22-identity.json"
+            "../../../../test-fixtures/pi-acp/profile-v28-identity.json"
         ))
         .unwrap();
         let mut value = descriptor("codex");
@@ -3211,6 +3227,8 @@ mod tests {
         current.validate(&context()).unwrap();
 
         for prior in [
+            include_str!("../../../../test-fixtures/pi-acp/profile-v24-identity.json"),
+            include_str!("../../../../test-fixtures/pi-acp/profile-v23-identity.json"),
             include_str!("../../../../test-fixtures/pi-acp/profile-v15-identity.json"),
             include_str!("../../../../test-fixtures/pi-acp/profile-v16-identity.json"),
             include_str!("../../../../test-fixtures/pi-acp/profile-v17-identity.json"),
@@ -3218,6 +3236,15 @@ mod tests {
             include_str!("../../../../test-fixtures/pi-acp/profile-v19-identity.json"),
             include_str!("../../../../test-fixtures/pi-acp/profile-v20-identity.json"),
             include_str!("../../../../test-fixtures/pi-acp/profile-v21-identity.json"),
+            include_str!("../../../../test-fixtures/pi-acp/profile-v22-identity.json"),
+            include_str!("../../../../test-fixtures/pi-acp/profile-v23-identity.json"),
+            include_str!("../../../../test-fixtures/pi-acp/profile-v24-identity.json"),
+            include_str!(
+                "../../../../test-fixtures/pi-acp/profile-v24-claude-historical-identity.json"
+            ),
+            include_str!("../../../../test-fixtures/pi-acp/profile-v25-identity.json"),
+            include_str!("../../../../test-fixtures/pi-acp/profile-v26-identity.json"),
+            include_str!("../../../../test-fixtures/pi-acp/profile-v27-identity.json"),
         ] {
             let prior: Value = serde_json::from_str(prior).unwrap();
             value["commandDigest"] = prior["commandDigest"].clone();
@@ -3517,6 +3544,7 @@ mod tests {
             permission_mode: Some(original_descriptor.permission_mode),
             mode: original_descriptor.mode.clone(),
             pi_thinking_level: original_descriptor.pi_thinking_level,
+            claude_effort: original_descriptor.claude_effort.clone(),
             provider_lifetime_fence_candidates: [60_001, 60_002, 60_003],
         };
         let operations = Vec::new();
@@ -3843,6 +3871,7 @@ mod tests {
             permission_mode: Some(original_descriptor.permission_mode),
             mode: original_descriptor.mode.clone(),
             pi_thinking_level: original_descriptor.pi_thinking_level,
+            claude_effort: original_descriptor.claude_effort.clone(),
             provider_lifetime_fence_candidates: [60_001, 60_002, 60_003],
         };
         let operations = Vec::new();
@@ -4167,6 +4196,7 @@ mod tests {
             permission_mode: Some(descriptor.permission_mode),
             mode: descriptor.mode.clone(),
             pi_thinking_level: descriptor.pi_thinking_level,
+            claude_effort: descriptor.claude_effort.clone(),
             provider_lifetime_fence_candidates,
         };
         let operations = Vec::new();
@@ -4340,6 +4370,7 @@ mod tests {
             permission_mode: Some(provider_descriptor.permission_mode),
             mode: provider_descriptor.mode.clone(),
             pi_thinking_level: provider_descriptor.pi_thinking_level,
+            claude_effort: provider_descriptor.claude_effort.clone(),
             provider_lifetime_fence_candidates,
         });
         state.provider_exit_unconfirmed = true;

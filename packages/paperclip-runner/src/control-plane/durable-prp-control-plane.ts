@@ -1,3 +1,4 @@
+import { AGENT_OBSERVABILITY_ENV_KEYS } from "../drivers/agent-observability.js";
 import { configuredEnvironment } from "../configured-environment.js";
 import { spawn } from "node:child_process";
 import {
@@ -291,6 +292,7 @@ export interface RunnerProcessHandle {
   completion: Promise<RunnerProcessResult>;
   processGroupId?: number | null;
   startedAt?: string;
+  isExitConfirmed?(): boolean;
   /** Relaunches the same immutable process specification; null forbids replacement. */
   restart?: ((ticket: string) => RunnerProcessHandle) | null;
 }
@@ -1497,6 +1499,7 @@ export class DurablePrpControlPlane {
   #expectedRunnerDigest: string;
   #server: Server | null = null;
   #connections = new Set<AuthorityConnection>();
+  #eventOwner: AuthorityConnection | null = null;
   // Set when the last authenticated Runner connection closes; cleared on the
   // next authentication. Diagnostic only: it never gates authority.
   #runnerDisconnectedAt: number | null = null;
@@ -2768,6 +2771,7 @@ export class DurablePrpControlPlane {
       clientProof,
     );
     this.#runnerDisconnectedAt = null;
+    this.#eventOwner = connection;
     for (const active of this.#connections) {
       if (active !== connection && active.secureChannel !== null)
         active.close();
@@ -3108,6 +3112,8 @@ export class DurablePrpControlPlane {
     connection: AuthorityConnection,
     envelope: Record<string, unknown>,
   ): Promise<void> {
+    if (this.#eventOwner !== connection) return;
+    const identity = this.#identity;
     if (this.#protocolIntegrityError !== null) {
       connection.close();
       return;
@@ -3240,6 +3246,7 @@ export class DurablePrpControlPlane {
     try {
       await this.#onCommittedEvent?.(event);
     } catch (error) {
+      if (this.#eventOwner !== connection || this.#identity !== identity) return;
       if (error instanceof NativeSessionProtocolIntegrityError) {
         this.#failProtocolIntegrity(connection, error);
       } else {
@@ -3247,6 +3254,7 @@ export class DurablePrpControlPlane {
       }
       return;
     }
+    if (this.#eventOwner !== connection || this.#identity !== identity) return;
     // Another authenticated connection can replace this one while its commit
     // is in flight. Once that exact owner has faulted, even a prior successful
     // commit cannot reopen delivery or invoke a new business operation.
@@ -3442,8 +3450,16 @@ const runnerExplicitProviderEnvironmentKeys = [
   "PAPERCLIP_NATIVE_MCP_NAME",
   "PAPERCLIP_NATIVE_MCP_URL",
   "PAPERCLIP_NATIVE_MCP_TOKEN",
+  "PAPERCLIP_NATIVE_MCP_STDIO",
+  "PAPERCLIP_NATIVE_MCP_PROXY",
   "PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH",
   "PAPERCLIP_RUNNER_EXTERNAL_SANDBOX",
+  "PAPERCLIP_RUNNER_HOME_MODE",
+  "ACPX_CLAUDE_INCLUDE_USER_SETTINGS",
+  "CLAUDE_CONFIG_DIR",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_CACHE_HOME",
   "PAPERCLIP_ACPX_BUILTIN_ROOT",
   "PAPERCLIP_ACPX_PROVIDER_PACKAGE_ROOT",
   "PAPERCLIP_ACPX_PROVIDER_PACKAGE_MANIFEST",
@@ -3469,7 +3485,7 @@ function runnerEnvironment(
   // already-sanitized environment for this run. Never inherit them implicitly
   // from the server process.
   if (explicitSource !== undefined) {
-    for (const key of runnerExplicitProviderEnvironmentKeys) {
+    for (const key of [...runnerExplicitProviderEnvironmentKeys, ...AGENT_OBSERVABILITY_ENV_KEYS]) {
       const value = explicitSource[key];
       if (value !== undefined) environment[key] = value;
     }
@@ -3647,7 +3663,12 @@ export function spawnRunner(options: {
   const environment = runnerEnvironment(options.ticket, options.identity.normalizedSessionId, options.environment);
   const withRestart = (handle: RunnerProcessHandle): RunnerProcessHandle => handle.restart === null ? handle : ({
     ...handle,
-    restart: (ticket) => spawnRunner({ ...options, ticket }),
+    restart: (ticket) => {
+      if (handle.isExitConfirmed?.() === false) {
+        throw new Error("runner_process_termination_unconfirmed");
+      }
+      return spawnRunner({ ...options, ticket });
+    },
   });
   if (options.processLauncher !== undefined) {
     return withRestart(
@@ -3743,7 +3764,7 @@ export async function waitForProcess(
 ): Promise<RunnerProcessResult> {
   let timer: NodeJS.Timeout | undefined;
   try {
-    return await Promise.race([
+    const result = await Promise.race([
       handle.completion,
       new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => {
@@ -3764,6 +3785,10 @@ export async function waitForProcess(
         }, timeoutMs);
       }),
     ]);
+    if (handle.isExitConfirmed?.() === false) {
+      throw new Error("runner_process_termination_unconfirmed");
+    }
+    return result;
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }
