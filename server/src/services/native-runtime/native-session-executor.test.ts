@@ -10939,14 +10939,14 @@ describe("runnerd provider runtime wiring", () => {
       await expect(createRunnerdBackend({ db: leaseDb(execution), execution: taskExecution, runnerInstanceId: "runner", runnerExecutionTarget: target }))
         .rejects.toThrow("runner_ingress_unavailable");
       await createRunnerdBackend({ db: leaseDb(execution), execution: taskExecution, runnerInstanceId: "runner", runnerExecutionTarget: target,
-        runnerIngressAuthorized: true, managedAiCredentialIdentity: "selected-account-revision",
+        runnerIngressAuthorized: true,
         runnerEnvironment: { HOME: "/controller/private", PATH: "/controller/bin", OPENAI_API_KEY: "fixture-secret",
           PAPERCLIP_NATIVE_MCP_NAME: "assigned", PAPERCLIP_NATIVE_MCP_URL: "http://localhost/mcp/gateways/assigned-test",
           PAPERCLIP_NATIVE_MCP_TOKEN: "fixture-mcp-secret" } });
       expect(state.toolAuthorityDefinitions).toHaveBeenCalledWith(expect.objectContaining({ assignedMcpTools }));
       expect(state.createAssignedMcpTools).toHaveBeenCalledWith(expect.objectContaining({ gatewayPublicId: "assigned-test", bearerToken: "fixture-mcp-secret" }));
       expect(owner).toHaveBeenCalledWith(expect.objectContaining({ task, projectIds: target.runnerTaskProjectIds,
-        credentialIdentity: "selected-account-revision" }));
+        credentialIdentity: undefined }));
       expect(state.createBackend.mock.calls.at(-1)![1]).toMatchObject({ workingDirectoryAuthority: "remote_runner", environment: {} });
       state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
       const options = state.createTransport.mock.calls.at(-1)![0];

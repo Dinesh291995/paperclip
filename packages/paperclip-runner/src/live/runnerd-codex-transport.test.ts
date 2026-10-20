@@ -25,6 +25,7 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it, vi } from "vitest";
 import type { ControlPlanePort } from "../contracts/control-plane-port.js";
+import { QUALIFIED_ACPX_PROFILES } from "../drivers/acpx/qualified-profiles.js";
 import { bindAcpxAgentFiles } from "../drivers/acpx/agent-files-binding.js";
 import type { NativeExecutionInputV1 } from "../contracts/native-execution.js";
 import type {
