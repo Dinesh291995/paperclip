@@ -1,5 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises";
-import { environmentTaskOperationSchema, environmentTaskResultSchema, type PluginEnvironmentTaskOperation, type PluginEnvironmentTaskResult } from "@paperclipai/plugin-sdk";
+import { environmentTaskOperationSchema, environmentTaskResultSchema, type PluginEnvironmentTaskOperation, type PluginEnvironmentTaskResult, type PluginEnvironmentTaskCredential } from "@paperclipai/plugin-sdk";
 import type { RunnerIngressEndpoint } from "@paperclipai/adapter-utils/runner-connectivity";
 import { RUNNER_PRP_PROTOCOL_MIN, RUNNER_PRP_PROTOCOL_MAX, type RunnerProcessHandle, type RunnerProcessLaunchSpec,
   type DurablePrpControlPlane, type RunnerExecutionDriver } from "../../vendor/paperclip-runner/index.js";
@@ -14,6 +14,9 @@ export function createPluginRunnerTaskOwner(input: {
   harness: string;
   resumeFrom?: string;
   credentialIdentity?: string;
+  accountIdentity?: string;
+  credential?: PluginEnvironmentTaskCredential;
+  onCredentials?: (credential: PluginEnvironmentTaskCredential) => Promise<void>;
   onSessionRetained?: () => Promise<void>;
   onDispatched?: () => Promise<void> | void;
   pollMs?: number;
@@ -37,7 +40,7 @@ export function createPluginRunnerTaskOwner(input: {
   void running.catch(() => undefined);
   const call = async (operation: PluginEnvironmentTaskOperation) => {
     const result = environmentTaskResultSchema.parse(await input.task(operation));
-    if (result.kind !== (operation.kind === "describe" ? "description" : ["status", "connection"].includes(operation.kind) ? operation.kind : "accepted")) {
+    if (result.kind !== (operation.kind === "describe" ? "description" : ["status", "connection", "credentials"].includes(operation.kind) ? operation.kind : "accepted")) {
       throw new Error("Plugin Runner returned an invalid operation result");
     }
     return result;
@@ -79,6 +82,8 @@ export function createPluginRunnerTaskOwner(input: {
       kind: "submit", projectIds: [...input.projectIds], bootstrapTicket: native.ticket,
       ...(input.resumeFrom ? { resumeFrom: input.resumeFrom } : {}),
       ...(input.credentialIdentity ? { credentialIdentity: input.credentialIdentity } : {}),
+      ...(input.accountIdentity ? { accountIdentity: input.accountIdentity } : {}),
+      ...(input.credential ? { credential: input.credential } : {}),
       runner: { protocolMin: RUNNER_PRP_PROTOCOL_MIN, protocolMax: RUNNER_PRP_PROTOCOL_MAX,
         harness: input.harness,
         runnerId: native.identity.runnerInstanceId, leaseId: native.identity.environmentLeaseId,
@@ -170,6 +175,11 @@ export function createPluginRunnerTaskOwner(input: {
       failure,
       checkpoint: async (settlement: "settled" | "unsettled") => {
         if (submitted) { stopRequested = true; await stopAndConfirm(); }
+        if (submitted && input.accountIdentity && input.onCredentials) {
+          const snapshot = await call({ kind: "credentials", accountIdentity: input.accountIdentity });
+          if (snapshot.kind !== "credentials") throw new Error("Plugin Runner credential snapshot unavailable");
+          await input.onCredentials(snapshot.credential);
+        }
         if (settlement === "settled" && stoppedState?.sessionStateAvailable === true) await input.onSessionRetained?.();
         if (submitted) await call({ kind: "complete" });
       },

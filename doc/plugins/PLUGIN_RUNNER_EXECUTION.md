@@ -23,7 +23,7 @@ type TaskHook = (params: Params) => Promise<Result>;
 | Core | Company and project authorization; execution identity; tool authority; PRP journal |
 | Plugin | Task identity; installed runtime and account; process lifecycle; authenticated WSS endpoint |
 | Runner | Provider execution; local resource paths; PRP session state |
-| Separate storage workflow | Resource installation; credential updates; file upload and download; backup |
+| Separate storage workflow | Resource installation; file upload and download; backup |
 
 The task API has no shell, file-copy, path-discovery, or resource-sync operation.
 The plugin can use an HTTP Launcher API, a process API, or another implementation.
@@ -160,6 +160,7 @@ During setup, Core uses a private, expiring probe identity. During cleanup, `env
 | `submit` | `accepted` | Start the saved task once |
 | `connection` | `connection` | Return the current authenticated WSS endpoint |
 | `status` | `status` | Read process and session-retention state |
+| `credentials` | `credentials` | Read refreshed credentials after process termination |
 | `stop` | `accepted` | Stop the task and its descendants |
 | `complete` | `accepted` | Release task grants after confirmed termination |
 
@@ -195,7 +196,9 @@ const request: Request<"submit"> = {
     sessionId: "session-id", turnId: "turn-id", itemId: "item-id",
   },
   bootstrapTicket: "<transient secret>",
-  credentialIdentity: "<Core-selected account revision>", // Optional.
+  credentialIdentity: "<Core-selected credential revision>", // Optional.
+  accountIdentity: "<Core-selected account>", // Optional.
+  credential: { type: "codex-auth-json", authJson: "<transient selected credential>" }, // Optional.
   resumeFrom: "<authorized prior task ID>", // Optional.
   launch: {
     runnerVersion: "<described version>",
@@ -207,17 +210,39 @@ const request: Request<"submit"> = {
 };
 ```
 
-1. Verify the installed account against `credentialIdentity`, when present.
-2. Reject the submission if the account does not match.
-3. Pass the bootstrap ticket and Runner identity to the Runner unchanged.
-4. Enforce the launch limits.
-5. Return the same task ID.
+1. Install the selected credential through a dedicated provider API, when present.
+2. Bind the task to `accountIdentity`. Use `credentialIdentity` for its current revision.
+3. Reject the submission if the account does not match.
+4. Pass the bootstrap ticket and Runner identity to the Runner unchanged.
+5. Enforce the launch limits.
+6. Return the same task ID.
 
 ```json
 { "kind": "accepted", "taskId": "attempt-opaque-id" }
 ```
 
 `accepted` confirms submission. It does not confirm PRP readiness or provider authentication. Core verifies both through the Runner.
+
+### Selected credentials
+
+Core can send a Codex login file or one approved Claude authentication variable.
+Credential values are transient RPC data.
+Do not save them in the task journal, lease metadata, logs, or errors.
+Use the account identity to prevent a change to a different account during retained execution.
+A credential refresh can keep the same account identity.
+
+After the task and its descendants stop, Core can send this request:
+
+```json
+{ "kind": "credentials", "accountIdentity": "<selected account>" }
+```
+
+Return the current credential only if the stopped task and credential slot have that account identity.
+Core compares Codex account identities and refresh times before it updates its private credential file.
+The existing AI connection service then saves a newer credential in the secret provider.
+A failed transfer keeps task grants available for recovery.
+The Core native path supports direct Codex and Claude accounts.
+Other managed provider routes require a dedicated credential projection before use.
 
 ### Connection
 

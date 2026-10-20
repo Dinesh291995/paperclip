@@ -11,6 +11,16 @@ const secureUrl = z.string().url().refine(value => {
   return url.protocol === "wss:" && !url.username && !url.password && !url.search && !url.hash;
 }, "Expected a credential-free WSS URL");
 
+const credentialValue = z.string().min(1).max(65_536).refine(value => !value.includes("\0"));
+/** Only provider authentication is transferred. Paths and executable settings remain provider-owned. */
+export const environmentTaskCredentialSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("codex-auth-json"), authJson: credentialValue }).strict(),
+  z.object({ type: z.literal("claude-env"), environment: z.object({
+    CLAUDE_CODE_OAUTH_TOKEN: credentialValue.optional(), ANTHROPIC_API_KEY: credentialValue.optional(),
+  }).strict().refine(env => Object.values(env).filter(Boolean).length === 1, "Select one Claude credential") }).strict(),
+]);
+export type PluginEnvironmentTaskCredential = z.infer<typeof environmentTaskCredentialSchema>;
+
 /** One plugin-provided Runner execution attempt with a PRP connection. Secrets are transient RPC input. */
 export const environmentTaskOperationSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("describe") }).strict(),
@@ -30,6 +40,9 @@ export const environmentTaskOperationSchema = z.discriminatedUnion("kind", [
     resumeFrom: z.string().min(1).optional(),
     /** Require the externally installed account to match this Core-selected credential revision. */
     credentialIdentity: z.string().min(1).max(1024).optional(),
+    /** Stable account selection; distinct from its current credential revision. */
+    accountIdentity: z.string().min(1).max(1024).optional(),
+    credential: environmentTaskCredentialSchema.optional(),
     /** Core supplies these protected launch inputs for native agent runs. */
     launch: z.object({
       runnerVersion: z.string().min(1), runnerDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
@@ -39,6 +52,7 @@ export const environmentTaskOperationSchema = z.discriminatedUnion("kind", [
       lifecyclePolicy: z.object({ mode: z.literal("per_turn"), idleTimeoutMs: z.null() }).strict(),
     }).strict().optional(),
   }).strict(),
+  z.object({ kind: z.literal("credentials"), accountIdentity: z.string().min(1).max(1024) }).strict(),
   z.object({ kind: z.literal("status") }).strict(),
   z.object({ kind: z.literal("connection") }).strict(),
   z.object({ kind: z.literal("complete") }).strict(),
@@ -47,6 +61,7 @@ export const environmentTaskOperationSchema = z.discriminatedUnion("kind", [
 
 export const environmentTaskResultSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("accepted"), taskId: providerId }).strict(),
+  z.object({ kind: z.literal("credentials"), taskId: providerId, credential: environmentTaskCredentialSchema }).strict(),
   z.object({ kind: z.literal("description"), taskId: providerId,
     runner: z.object({ version: z.string().min(1), digest: z.string().regex(/^sha256:[a-f0-9]{64}$/) }).strict(),
   }).strict(),
@@ -92,7 +107,7 @@ export interface PluginEnvironmentTaskParams extends Omit<PluginEnvironmentDrive
 /** An accepted stop is not proof of process termination. */
 export function parseEnvironmentTaskResult(operation: PluginEnvironmentTaskOperation, taskId: string, value: unknown): PluginEnvironmentTaskResult {
   const result = environmentTaskResultSchema.parse(value);
-  const expected = operation.kind === "describe" ? "description" : ["status", "connection"].includes(operation.kind) ? operation.kind : "accepted";
+  const expected = operation.kind === "describe" ? "description" : ["status", "connection", "credentials"].includes(operation.kind) ? operation.kind : "accepted";
   if (result.taskId !== taskId || result.kind !== expected) throw new Error("Invalid plugin-provided Runner execution response");
   return result;
 }

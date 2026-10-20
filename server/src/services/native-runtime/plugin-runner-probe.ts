@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { AdapterEnvironmentTestContext, AdapterEnvironmentTestResult } from "@paperclipai/adapter-utils";
 import { environmentTaskResultSchema } from "@paperclipai/plugin-sdk";
 import { probeNativeRunnerEnvironment } from "../../vendor/paperclip-runner/index.js";
+import { preparePluginRunnerCredentials } from "./plugin-runner-credentials.js";
 import { createPluginRunnerTaskOwner } from "./plugin-runner-task.js";
 import { resolvePaperclipRunnerProviderProfile } from "./provider-profile.js";
 import { resolveAcpxQualification } from "./acpx-qualification.js";
@@ -27,7 +28,14 @@ export async function probePluginRunnerEnvironment(context: AdapterEnvironmentTe
     if (profile.provider !== "codex" && profile.provider !== "opencode" && profile.provider !== "acpx") throw new Error("Plugin Runner setup requires a workspace harness");
     const description = environmentTaskResultSchema.parse(await task({ kind: "describe" }));
     if (description.kind !== "description") throw new Error("Plugin Runner artifact identity unavailable");
-    const owner = createPluginRunnerTaskOwner({ task, projectIds: [],
+    const account = context.config.managedAiConnection as { identity?: string; sessionIdentity?: string } | undefined;
+    const environment = (context.config.env ?? {}) as NodeJS.ProcessEnv;
+    const credentials = await preparePluginRunnerCredentials({
+      provider: profile.provider === "acpx" ? profile.acpxAgent! : profile.provider,
+      identity: account?.identity, accountIdentity: account?.sessionIdentity,
+      home: environment.CODEX_HOME, environment,
+    });
+    const owner = createPluginRunnerTaskOwner({ ...credentials, task, projectIds: [],
       harness: profile.provider === "acpx" ? profile.acpxAgent! : profile.provider,
       credentialIdentity: (context.config.managedAiConnection as { identity?: string } | undefined)?.identity });
     probeStarted = true;

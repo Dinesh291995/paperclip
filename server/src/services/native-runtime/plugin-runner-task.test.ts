@@ -29,6 +29,43 @@ function provider() {
 }
 
 describe("plugin native Runner ownership", () => {
+  it("collects refreshed credentials after process termination and before releasing task grants", async () => {
+    const { task } = provider();
+    const perform = task.getMockImplementation()!;
+    const credential = { type: "codex-auth-json" as const, authJson: '{"OPENAI_API_KEY":"fixture-key"}' };
+    let copied = false;
+    task.mockImplementation(async operation => {
+      if (operation.kind === "credentials") {
+        expect(task.mock.calls.some(([op]) => op.kind === "stop")).toBe(true);
+        return { kind: "credentials", taskId: "task", credential };
+      }
+      if (operation.kind === "complete") expect(copied).toBe(true);
+      return perform(operation);
+    });
+    ingress.connect.mockReturnValue({ ready: Promise.resolve(), close: async () => {} });
+    const owner = createPluginRunnerTaskOwner({ task, projectIds: [], harness: "codex", credential,
+      credentialIdentity: "revision", accountIdentity: "stable-account", pollMs: 1,
+      onCredentials: async value => { expect(value).toEqual(credential); copied = true; } });
+    const registration = await owner.registration({} as never, "run");
+    const process = owner.launcher(launchSpec()); registration.activate(); await registration.ready();
+    expect(task.mock.calls.find(([op]) => op.kind === "submit")?.[0]).toMatchObject({ credential, credentialIdentity: "revision", accountIdentity: "stable-account" });
+    await registration.release(); await registration.checkpoint("settled"); await process.completion;
+    expect(copied).toBe(true);
+  });
+  it("retains grants when the credential handoff fails", async () => {
+    const { task } = provider();
+    const perform = task.getMockImplementation()!;
+    task.mockImplementation(async op => op.kind === "credentials" ? { kind: "credentials", taskId: "task", credential: { type: "codex-auth-json", authJson: "{}" } } : perform(op));
+    ingress.connect.mockReturnValue({ ready: Promise.resolve(), close: async () => {} });
+    const owner = createPluginRunnerTaskOwner({ task, projectIds: [], harness: "codex", accountIdentity: "account", pollMs: 1,
+      onCredentials: async () => { throw new Error("credential handoff failed"); } });
+    const registration = await owner.registration({} as never, "run");
+    const process = owner.launcher(launchSpec()); registration.activate(); await registration.ready(); await registration.release();
+    await expect(registration.checkpoint("settled")).rejects.toThrow("credential handoff failed");
+    await process.completion;
+    expect(task.mock.calls.some(([op]) => op.kind === "complete")).toBe(false);
+  });
+
   it.each([false, true])("records retained sessions after status failures (retry exhausted: %s)", async exhausted => {
     const { task } = provider();
     const perform = task.getMockImplementation()!;

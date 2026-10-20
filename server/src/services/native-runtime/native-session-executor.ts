@@ -1,5 +1,6 @@
 import { resolvePluginTaskResume } from "../environment-task-runtime.js";
 import { environmentTaskResultSchema } from "@paperclipai/plugin-sdk";
+import { preparePluginRunnerCredentials } from "./plugin-runner-credentials.js";
 import { createPluginRunnerTaskOwner } from "./plugin-runner-task.js";
 import { applyObservabilityEnvironment, type ProviderObservabilityLaunch } from "@paperclipai/adapter-utils/agent-observability";
 import { museRunnerBroker } from "../muse-runner-broker.js";
@@ -459,6 +460,7 @@ type WarmNativeSession = {
   instructionCopy?: { runId: string; root?: string; targetIdentity: string; collectStopped: () => Promise<void> };
   preparingRunId?: string;
   managedAiCredentialIdentity?: string;
+  managedAiAccountIdentity?: string;
   credentialRunId?: string;
   githubAccess?: NativeGitHubAccess;
   githubAuthenticationMode?: string;
@@ -7549,6 +7551,7 @@ export async function executePaperclipNativeSession(input: {
   /** Private grant materialization; never a user-configured host path. */
   managedAiCredentialHome?: string;
   managedAiCredentialIdentity?: string;
+  managedAiAccountIdentity?: string;
   billingIdentity?: Pick<AdapterExecutionResult, "provider" | "biller" | "billingType">;
   onTaskDispatched?: () => Promise<void> | void;
   runnerExecutionTarget?: AdapterExecutionTarget | null;
@@ -11385,6 +11388,7 @@ export async function createRunnerdBackend(input: {
   /** Private grant materialization; never a user-configured host path. */
   managedAiCredentialHome?: string;
   managedAiCredentialIdentity?: string;
+  managedAiAccountIdentity?: string;
   onTaskDispatched?: () => Promise<void> | void;
   runnerExecutionTarget?: AdapterExecutionTarget | null;
   /** Resolved per-run authorization; not an independent instance setting. */
@@ -11706,7 +11710,12 @@ async function createRunnerdBackendWithinSessionClaim(
     const resumeFrom = prior && prior.runId !== input.execution.binding.runId
       ? await resolvePluginTaskResume(input.db, { companyId: input.execution.binding.companyId,
           leaseId: remoteTarget.leaseId!, priorIdentity: prior }) : undefined;
-    const owner = createPluginRunnerTaskOwner({ task: pluginTask, projectIds: remoteTarget.runnerTaskProjectIds ?? [],
+    const credentials = await preparePluginRunnerCredentials({
+      provider: provider.kind === "acpx" ? provider.agent : provider.kind,
+      identity: input.managedAiCredentialIdentity, accountIdentity: input.managedAiAccountIdentity,
+      home: input.managedAiCredentialHome, environment: input.runnerEnvironment ?? {},
+    });
+    const owner = createPluginRunnerTaskOwner({ ...credentials, task: pluginTask, projectIds: remoteTarget.runnerTaskProjectIds ?? [],
       harness: provider.kind === "acpx" ? provider.agent : provider.kind, resumeFrom,
       credentialIdentity: input.managedAiCredentialIdentity,
       onSessionRetained: async () => {
